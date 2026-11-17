@@ -262,6 +262,7 @@ JNIEXPORT jobject JNICALL Java_sun_security_krb5_Credentials_acquireDefaultNativ
     int netypes;
     jint *etypes = NULL;
     int proxy_flag = 0;
+    int pass;
 
     /* Initialize the Kerberos 5 context */
     err = krb5_init_context (&kcontext);
@@ -316,14 +317,17 @@ JNIEXPORT jobject JNICALL Java_sun_security_krb5_Credentials_acquireDefaultNativ
     }
     // End of first round read
 
-    if (!err) {
-        err = krb5_cc_start_seq_get (kcontext, ccache, &cursor);
-    }
-
     netypes = (*env)->GetArrayLength(env, jetypes);
     etypes = (jint *) (*env)->GetIntArrayElements(env, jetypes, NULL);
 
-    if (etypes != NULL && !err) {
+    // Pass 0 accepts only valid TGTs. Pass 1 falls back to expired but
+    // renewable ones, so that the login module can renew them (renewTGT).
+    for (pass = 0; etypes != NULL && !err && krbCreds == NULL && pass < 2
+            && !(*env)->ExceptionCheck(env); pass++) {
+        err = krb5_cc_start_seq_get (kcontext, ccache, &cursor);
+        if (err) {
+            break;
+        }
         while ((err = krb5_cc_next_cred (kcontext, ccache, &cursor, &creds)) == 0) {
             char *serverName = NULL;
 
@@ -335,14 +339,18 @@ JNIEXPORT jobject JNICALL Java_sun_security_krb5_Credentials_acquireDefaultNativ
             if (!err) {
                 char* slash = strchr(serverName, '/');
                 char* at = strchr(serverName, '@');
-                // Make sure the server's name is krbtgt/REALM@REALM, the etype
-                // is supported, and the ticket has not expired
+                // Make sure the server's name is krbtgt/REALM@REALM and the
+                // etype is supported. In pass 1 also accept an expired TGT
+                // that is still renewable.
                 if (slash && at &&
                         strncmp (serverName, "krbtgt", slash-serverName) == 0 &&
                             // the ablove line shows at must be after slash
                         strncmp (slash+1, at+1, at-slash-1) == 0 &&
                         isIn (creds.keyblock.enctype, netypes, etypes) &&
-                        creds.times.endtime > time(0)) {
+                        (creds.times.endtime > time(0) ||
+                            (pass > 0 &&
+                                (creds.ticket_flags & TKT_FLG_RENEWABLE) &&
+                                creds.times.renew_till > time(0)))) {
                     jobject ticket, clientPrincipal, targetPrincipal, encryptionKey;
                     jobject ticketFlags, startTime, endTime;
                     jobject authTime, renewTillTime, hostAddresses;
@@ -438,11 +446,10 @@ cleanup:
 
         if (err == KRB5_CC_END) { err = 0; }
         printiferr (err, "while retrieving a ticket");
-    }
-
-    if (!err) {
-        err = krb5_cc_end_seq_get (kcontext, ccache, &cursor);
-        printiferr (err, "while finishing ticket retrieval");
+        if (!err) {
+            err = krb5_cc_end_seq_get (kcontext, ccache, &cursor);
+            printiferr (err, "while finishing ticket retrieval");
+        }
     }
 
 outer_cleanup:
