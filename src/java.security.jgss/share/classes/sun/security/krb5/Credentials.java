@@ -65,6 +65,13 @@ public class Credentials {
     AuthorizationData authzData;
     static boolean alreadyLoaded = false;
     private static boolean alreadyTried = false;
+    // On Linux, let the system Kerberos library resolve the default ccache
+    // (KRB5CCNAME, default_ccache_name incl. KCM/DIR) before the pure-Java
+    // file fallback.
+    private static final boolean nativeDefaultCacheFirst =
+            System.getProperty("os.name").startsWith("Linux")
+            && Boolean.parseBoolean(System.getProperty(
+                    "sun.security.krb5.nativeDefaultCacheFirst", "true"));
 
     public static final boolean S4U2PROXY_ACCEPT_NON_FORWARDABLE
             = "true".equalsIgnoreCase(SecurityProperties.getOverridableProperty(
@@ -396,6 +403,8 @@ public class Credentials {
 
     /**
      * Acquires default credentials.
+     * <br>On Linux the system Kerberos library resolves the default cache
+     * first; the pure-Java order below is the fallback.
      * <br>The possible locations for default credentials cache is searched in
      * the following order:
      * <ol>
@@ -419,53 +428,64 @@ public class Credentials {
     public static synchronized Credentials acquireDefaultCreds() {
         Credentials result = null;
 
-        CredentialsCache cache = CredentialsCache.getInstance();
+        if (nativeDefaultCacheFirst) {
+            result = tryNativeDefaultCreds();
+        }
 
-        if (cache != null) {
-            Credentials temp = cache.getInitialCreds();
-            if (temp != null) {
-                if (DEBUG != null) {
-                    DEBUG.println(">>> KrbCreds found the default ticket"
-                            + " granting ticket in credential cache.");
-                }
-                if (EType.isSupported(temp.key.getEType())) {
-                    result = temp;
-                } else {
+        if (result == null) {
+            CredentialsCache cache = CredentialsCache.getInstance();
+            if (cache != null) {
+                Credentials temp = cache.getInitialCreds();
+                if (temp != null) {
                     if (DEBUG != null) {
-                        DEBUG.println(
+                        DEBUG.println(">>> KrbCreds found the default ticket"
+                                + " granting ticket in credential cache.");
+                    }
+                    if (EType.isSupported(temp.key.getEType())) {
+                        result = temp;
+                    } else {
+                        if (DEBUG != null) {
+                            DEBUG.println(
                             ">>> unsupported key type found the default TGT: " +
                             temp.key.getEType());
+                        }
                     }
                 }
             }
         }
-        if (result == null) {
-            // Doesn't seem to be a default cache on this system or
-            // TGT has unsupported encryption type
 
-            if (!alreadyTried) {
-                // See if there's any native code to load
-                try {
-                    ensureLoaded();
-                } catch (Exception e) {
-                    if (DEBUG != null) {
-                        DEBUG.println("Can not load native ccache library");
-                        e.printStackTrace();
-                    }
-                    alreadyTried = true;
-                }
-            }
-            if (alreadyLoaded) {
-                // There is some native code
+        if (result == null && !nativeDefaultCacheFirst) {
+            result = tryNativeDefaultCreds();
+        }
+        return result;
+    }
+
+    private static Credentials tryNativeDefaultCreds() {
+        Credentials result = null;
+
+        if (!alreadyTried) {
+            // See if there's any native code to load
+            try {
+                ensureLoaded();
+            } catch (Throwable t) {
+                // a missing native library surfaces as UnsatisfiedLinkError
                 if (DEBUG != null) {
-                    DEBUG.println(">> Acquire default native Credentials");
+                    DEBUG.println("Can not load native ccache library");
+                    t.printStackTrace();
                 }
-                try {
-                    result = acquireDefaultNativeCreds(
-                            EType.getDefaults("default_tkt_enctypes"));
-                } catch (KrbException ke) {
-                    // when there is no default_tkt_enctypes.
-                }
+                alreadyTried = true;
+            }
+        }
+        if (alreadyLoaded) {
+            // There is some native code
+            if (DEBUG != null) {
+                DEBUG.println(">> Acquire default native Credentials");
+            }
+            try {
+                result = acquireDefaultNativeCreds(
+                        EType.getDefaults("default_tkt_enctypes"));
+            } catch (KrbException ke) {
+                // when there is no default_tkt_enctypes.
             }
         }
         return result;
